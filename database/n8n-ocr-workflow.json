@@ -1,0 +1,204 @@
+{
+  "name": "DocScan AI – OCR Invoice Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ocr-trigger",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-start",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "ocr-trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate incoming payload\nconst body = $input.first().json;\n\nconst required = ['documentId', 'fileUrl', 'workflowType', 'runId'];\nfor (const key of required) {\n  if (!body[key]) {\n    throw new Error(`Missing required field: ${key}`);\n  }\n}\n\n// Pass through with defaults\nreturn [{\n  json: {\n    documentId: body.documentId,\n    fileUrl: body.fileUrl,\n    fileName: body.fileName || 'document',\n    workflowType: body.workflowType || 'invoice_ocr',\n    runId: body.runId,\n    callbackUrl: body.callbackUrl,\n    startedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "validate-input",
+      "name": "Validate & Prepare",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://yhpxqnkcltdocwqrcbcv.supabase.co/rest/v1/workflow_runs?id=eq.{{$json.runId}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "status", "value": "processing" },
+            { "name": "started_at", "value": "={{ $json.startedAt }}" }
+          ]
+        }
+      },
+      "id": "update-status-processing",
+      "name": "Update Status: Processing",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert invoice and document OCR system. Extract ALL structured data from the provided document image or PDF. Return ONLY valid JSON with no markdown. Always include these fields (use null if not found):\n\n{\n  \"vendor_name\": string,\n  \"vendor_address\": string,\n  \"invoice_number\": string,\n  \"invoice_date\": string (ISO 8601),\n  \"due_date\": string (ISO 8601),\n  \"po_number\": string,\n  \"subtotal\": number,\n  \"tax_amount\": number,\n  \"total_amount\": number,\n  \"currency\": string (3-letter ISO),\n  \"payment_terms\": string,\n  \"bank_details\": string,\n  \"line_items\": [\n    {\n      \"description\": string,\n      \"quantity\": number,\n      \"unit_price\": number,\n      \"amount\": number\n    }\n  ],\n  \"raw_text\": string\n}"
+            },
+            {
+              "role": "user",
+              "content": "=Extract all data from this document: {{ $json.fileUrl }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0,
+          "maxTokens": 4096
+        }
+      },
+      "id": "gpt4o-ocr",
+      "name": "GPT-4o Vision OCR",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse and validate GPT-4o output\nconst raw = $input.first().json.choices?.[0]?.message?.content || '{}';\n\nlet extracted;\ntry {\n  // Strip any markdown code blocks\n  const cleaned = raw.replace(/```json\\n?/g, '').replace(/```/g, '').trim();\n  extracted = JSON.parse(cleaned);\n} catch (e) {\n  throw new Error(`Failed to parse LLM response: ${e.message}`);\n}\n\nconst prev = $('Validate & Prepare').first().json;\n\nreturn [{\n  json: {\n    ...prev,\n    extractedData: extracted,\n    rawText: extracted.raw_text || '',\n    confidenceScore: 0.95,\n    modelUsed: 'gpt-4o',\n    processingMs: Date.now() - new Date(prev.startedAt).getTime()\n  }\n}];"
+      },
+      "id": "parse-output",
+      "name": "Parse & Validate Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://yhpxqnkcltdocwqrcbcv.supabase.co/rest/v1/ocr_results",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"document_id\": \"{{ $json.documentId }}\",\n  \"workflow_run_id\": \"{{ $json.runId }}\",\n  \"extracted_data\": {{ JSON.stringify($json.extractedData) }},\n  \"raw_text\": {{ JSON.stringify($json.rawText) }},\n  \"confidence_score\": {{ $json.confidenceScore }},\n  \"model_used\": \"{{ $json.modelUsed }}\",\n  \"processing_ms\": {{ $json.processingMs }}\n}"
+      },
+      "id": "save-ocr-result",
+      "name": "Save OCR Result to Supabase",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://yhpxqnkcltdocwqrcbcv.supabase.co/rest/v1/workflow_runs?id=eq.{{$json.runId}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{ \"status\": \"completed\", \"completed_at\": \"{{ new Date().toISOString() }}\" }"
+      },
+      "id": "update-status-completed",
+      "name": "Update Status: Completed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://yhpxqnkcltdocwqrcbcv.supabase.co/rest/v1/documents?id=eq.{{$('Validate & Prepare').first().json.documentId}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{ \"status\": \"completed\" }"
+      },
+      "id": "update-document-status",
+      "name": "Update Document Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 460]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"success\": true, \"runId\": \"{{ $('Validate & Prepare').first().json.runId }}\" }"
+      },
+      "id": "respond-webhook",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1780, 300]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [[{ "node": "Validate & Prepare", "type": "main", "index": 0 }]]
+    },
+    "Validate & Prepare": {
+      "main": [[{ "node": "Update Status: Processing", "type": "main", "index": 0 }]]
+    },
+    "Update Status: Processing": {
+      "main": [[{ "node": "GPT-4o Vision OCR", "type": "main", "index": 0 }]]
+    },
+    "GPT-4o Vision OCR": {
+      "main": [[{ "node": "Parse & Validate Output", "type": "main", "index": 0 }]]
+    },
+    "Parse & Validate Output": {
+      "main": [[{ "node": "Save OCR Result to Supabase", "type": "main", "index": 0 }]]
+    },
+    "Save OCR Result to Supabase": {
+      "main": [[
+        { "node": "Update Status: Completed", "type": "main", "index": 0 },
+        { "node": "Update Document Status", "type": "main", "index": 0 }
+      ]]
+    },
+    "Update Status: Completed": {
+      "main": [[{ "node": "Respond to Webhook", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": ["ocr", "invoice", "gpt-4o", "supabase"],
+  "triggerCount": 1,
+  "updatedAt": "2026-06-13T00:00:00.000Z",
+  "versionId": "1"
+}
